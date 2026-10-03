@@ -330,9 +330,13 @@ function modulePrompt(module: RequirementModule, completedIds: string[], focus?:
     "- Members/people lists must render every seeded member's username as exact visible text, with row action buttons named `Member menu <username>` (pattern `<menu label> <row identity>`) whose menuitems match the requirement verbs, visible only to users allowed to manage.",
     "- Account menu must contain the entries the scenario clicks (typically Settings and Your organizations) before those clicks happen.",
     "",
-    "ROLE WIDGET CONTRACT: dropdowns that tests pick options from must expose role=combobox with clickable role=option items (a custom listbox - native select popups are not clickable in tests). Widgets the tests call selectOption() on must be native <select> elements. Table rows with editable values use role=row with a per-row control and a Save button. Row action menus are buttons named `Member menu <value>` (pattern: `<menu label> <row identity>`) exposing menuitem entries, whose confirm dialogs use the verb button named exactly as the scenario states.",
+    "ROLE WIDGET CONTRACT: dropdowns that tests pick options from must expose role=combobox with clickable role=option items (a custom listbox - native select popups are not clickable in tests). Widgets the tests call selectOption() on must be native <select> elements. Search inputs are role=searchbox named so that a /search/i name matcher finds exactly one. Table rows with editable values use role=row with a per-row control and a Save button. Row action menus are buttons named `Member menu <value>` (pattern: `<menu label> <row identity>`) exposing menuitem entries, whose confirm dialogs use the verb button named exactly as the scenario states. Menu-command flows (Add file -> Create new file) use role=menuitem entries. When the requirement distinguishes a button and a link with similar names (e.g. a \"Code\" button vs a \"Code\" link), render BOTH with their exact distinct names.",
     "",
-    "TEXT UNIQUENESS: each exact value (roles, usernames, names) must appear in at most one visible text node on a page. Repeating labels like role names must not repeat across rows as plain text - use controls whose closed state does not render the label as text, or vary display so exactly one exact-match node exists.",
+    "TEXT UNIQUENESS (tests match names by exact OR case-insensitive substring/regex - strict mode fails on multiple matches): for ANY name-like token used on a page, exactly ONE visible element may match it as a substring. Never let one accessible name contain another name used on the same page (a link named \"Code search\" breaks a getByRole('link', {name: /code/i}) lookup for \"Code\"). Repeating labels (role names etc.) must not appear as plain text across rows - use controls whose closed state does not render the label as text. Empty states show exactly ONE empty-state text (e.g. \"No results\"), never two variations at once. Labels the requirement phrases as patterns must contain the matcher words (e.g. a field matched as /file name/i needs a label containing \"file name\").",
+    "",
+    "ROOT EXPOSURE: every entity the requirement mentions (organizations, repositories, branches, commits, users) must be reachable as an exact-name clickable link starting from the application root/home page - test helpers retry from the root and click targets by exact name. Home/listing pages must therefore show these entities as exact-name links (seeded repos and orgs included). Commit history entries the scenarios click must be links named by their commit message.",
+    "",
+    "VALIDATION WHITELISTS: when the requirement states allowed characters or ranges (e.g. branch names: ASCII letters/digits/-/_/./ only, no trailing / or ., no .. or //), enforce that exact whitelist - do NOT substitute a git-style blacklist. Reject-and-explain with the requirement's exact error text.",
     "",
     "SEED IDENTIFIERS: entities may have both an identifier (URL/name) and a display name (link text) - seed both exactly as the requirement states; links display the display name, headings/URLs use the identifier. Every backticked seed/example value in the requirement must exist in the database seed and appear verbatim where scenarios expect it.",
     "",
@@ -816,9 +820,12 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
   const logsDir = path.join(outputDir, ".arc", "logs");
   const runStartedAt = new Date().toISOString().replace(/[:.]/g, "-");
   const watchdog = startPortWatchdog(webPort, outputDir);
-  let useHotSession = false;
 
   for (const module of modules) {
+    // Per-module session: turns within a module share one hot session, but each
+    // module starts fresh - a single growing session across all turns re-sends
+    // the whole conversation every turn (O(n^2) token cost, $18 runs).
+    let useHotSession = false;
     log(`[module ${module.index}/${module.total}] ${module.nodeId} - ${module.name}`);
     runtime.events.markImplementationStarted(module.nodeId, `opencode implementing ${module.name}`);
 
@@ -966,9 +973,10 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
   clearInterval(watchdog);
 
   // FINAL_CHECK: strict-mode self-audit pass (octos FINAL_CHECK equivalent).
-  log(`[final-check] strict-mode audit${useHotSession ? " [continue]" : ""}`);
+  // Fresh session: it must audit the whole app with its own eyes, and a fresh
+  // session also avoids re-carrying every module's transcript.
+  log("[final-check] strict-mode audit");
   const finalArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${modelId}`, "--dangerously-skip-permissions"];
-  if (useHotSession) finalArgv.push("--continue");
   finalArgv.push(FINAL_CHECK_PROMPT(webPort));
   await runCommand(opencodeBin, finalArgv, {
     cwd: outputDir,
@@ -980,7 +988,6 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
     logFile: path.join(logsDir, `${runStartedAt}-final-check.log`),
     heartbeatLabel: "final-check",
   });
-  useHotSession = true;
 
   // VERBATIM LINT: mechanical check of requirement quoted strings vs source.
   // Fixes "Create an organization" vs "Create organization" class of failures
@@ -992,7 +999,7 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
   if (navOffenders.length) log(`[lint] router-Link offenders: ${navOffenders.slice(0, 6).join(", ")}${navOffenders.length > 6 ? " ..." : ""}`);
   if (missing.length || navOffenders.length) {
     log(`[verbatim] sending fix turn (strings=${missing.length}, nav=${navOffenders.length})`);
-    const fixArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${modelId}`, "--dangerously-skip-permissions", "--continue", VERBATIM_FIX_PROMPT(missing, navOffenders)];
+    const fixArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${modelId}`, "--dangerously-skip-permissions", VERBATIM_FIX_PROMPT(missing, navOffenders)];
     await runCommand(opencodeBin, fixArgv, {
       cwd: outputDir,
       env: {

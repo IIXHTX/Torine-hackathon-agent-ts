@@ -1,0 +1,7 @@
+node_modules/
+*.log
+*.zip
+.arc/
+test-results/
+dist/
+.env

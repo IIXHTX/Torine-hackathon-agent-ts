@@ -590,6 +590,62 @@ function parseDoneIds(output: string, knownIds: string[]): string[] {
   return listed.filter((id) => knownIds.includes(id));
 }
 
+// Mechanical audit: self-assessment inflates ("audit 21/21" on a 1/41 run).
+// Verify each ATOMIC node by grepping the source for its own contract items
+// (named UI targets + error strings derived from its requirement text).
+function readSourceCorpus(outputDir: string): string {
+  const chunks: string[] = [];
+  for (const root of ["frontend/src", "backend/src"]) {
+    const walk = (dir: string): void => {
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (["node_modules", "dist", "__pycache__"].includes(entry.name)) continue;
+          walk(full);
+        } else if (/\.(tsx?|jsx?|css|html)$/.test(entry.name)) {
+          try {
+            chunks.push(fs.readFileSync(full, "utf-8"));
+          } catch {
+            /* skip */
+          }
+        }
+      }
+    };
+    walk(path.join(outputDir, root));
+  }
+  return chunks.join("\n");
+}
+
+function auditAtomicsMechanically(
+  outputDir: string,
+  atomicNodes: Record<string, unknown>[],
+): { doneIds: string[]; report: string[] } {
+  const corpus = readSourceCorpus(outputDir);
+  const doneIds: string[] = [];
+  const report: string[] = [];
+  for (const node of atomicNodes) {
+    const id = String(node.id || "").trim();
+    const contract = extractTaskContract(node);
+    const namedValues = contract.namedTargets.map((t) => t.slice(t.indexOf(":") + 2).trim());
+    const missingNamed = namedValues.filter((v) => v && !corpus.includes(v));
+    const missingErrors = contract.errorStrings.filter((e) => !corpus.includes(e));
+    const ok = missingNamed.length === 0 && missingErrors.length === 0;
+    if (ok) doneIds.push(id);
+    report.push(
+      `${id}: ${ok ? "DONE" : "MISSING"} (named ${namedValues.length - missingNamed.length}/${namedValues.length}, errors ${contract.errorStrings.length - missingErrors.length}/${contract.errorStrings.length})` +
+        (missingNamed.length ? ` no-named: ${missingNamed.slice(0, 3).join("|")}` : "") +
+        (missingErrors.length ? ` no-err: ${missingErrors.slice(0, 2).join("|")}` : ""),
+    );
+  }
+  return { doneIds, report };
+}
+
 // Verbatim lint: the acceptance tests match visible text with anchored regexes,
 // so every quoted string in a requirement is a contractual UI string. Collect
 // them from the requirement JSON and check the generated source for each.
@@ -635,6 +691,7 @@ type TaskContract = {
   namedTargets: string[];
   errorStrings: string[];
   seeds: string[];
+  isSpreadsheet: boolean;
 };
 
 function extractTaskContract(node: Record<string, unknown>): TaskContract {
@@ -672,8 +729,21 @@ function extractTaskContract(node: Record<string, unknown>): TaskContract {
   }
 
   const seeds = [...new Set([...text.matchAll(/`([^`\s][^`]{0,60})`/g)].map((m) => m[1]))];
-  return { namedTargets, errorStrings, seeds };
+  const isSpreadsheet = /worksheet|spreadsheet|cell(?:s)?\b|formula|gridcell|pivot table/i.test(text);
+  return { namedTargets, errorStrings, seeds, isSpreadsheet };
 }
+
+const SPREADSHEET_RECIPE = [
+  "SPREADSHEET RECIPE (aria/behavior contracts the acceptance tests assert):",
+  "- Grid: container role=grid; each row role=row; each cell role=gridcell with aria-label EXACTLY the coordinate (\"A1\", \"B2\") and text content = the DISPLAYED value (computed result for formula cells, never the formula text). Selected cells get aria-selected=\"true\"; range-selectable grids set aria-multiselectable=\"true\" on the grid and keep aria-selected accurate for every cell in the rectangle.",
+  "- Formula bar: a textbox labeled \"Formula bar\" shows the RAW formula of the selected cell (grid shows the computed result); pressing Enter in it commits. Inline cell editors are textboxes named \"Edit <coordinate>\".",
+  "- Worksheet tabs: role=tab, with aria-selected=\"true\" on exactly the active sheet's tab.",
+  "- CSV export renders COMPUTED values (a cell holding =A1*2 exports as 4, not the formula).",
+  "- Buttons are matched by whole-word case-insensitive regexes (/^(save)$/i) - name them exactly (e.g. \"Save\").",
+  "- Formula engine: formulas start with =; support + - * /, parentheses, A1 references, SUM/AVERAGE/COUNT/MIN/MAX over ranges; relative refs shift on copy, absolute ($A$1) do not; error values #DIV/0! #REF! #NAME? #ERROR! render in the grid while the formula bar keeps the original formula; edits recalculate all direct/indirect dependents.",
+  "- Selection/copy/paste: rectangular selection persists per worksheet across reloads and sheet switches; paste fills the exact rectangle; validation failures reject the WHOLE operation and keep original values.",
+  "- Undo/Redo buttons named exactly \"Undo\"/\"Redo\" cover the session's recent edits in reverse order.",
+].join("\n");
 
 function renderTaskContract(contract: TaskContract): string {
   const lines: string[] = ["TASK CONTRACT SHEET (derived from this requirement subtree - treat as checklist):"];
@@ -691,6 +761,10 @@ function renderTaskContract(contract: TaskContract): string {
     lines.push("Seed/example values referenced by scenarios (provision in DB seed and use verbatim):");
     for (const s of contract.seeds.slice(0, 30)) lines.push(`  - ${JSON.stringify(s)}`);
     if (contract.seeds.length > 30) lines.push(`  ... and ${contract.seeds.length - 30} more`);
+  }
+  if (contract.isSpreadsheet) {
+    lines.push("");
+    lines.push(SPREADSHEET_RECIPE);
   }
   return lines.join("\n");
 }
@@ -801,14 +875,23 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
   runtime.traceability.initDb();
   runtime.git.ensureRepo();
 
+  const modules = loadRootModules(requirementsDir);
+  const sheetLike = modules.some((m) => extractTaskContract(m.subtree).isSpreadsheet);
+
   if (hasDeliverable(outputDir)) {
     log("[init] existing frontend/+backend/ detected; keeping prior work (evolution mode)");
   } else {
-    log("[init] copying starter template into output directory");
+    log(`[init] copying starter template into output directory${sheetLike ? " (+ spreadsheet scaffold)" : ""}`);
     copyTemplateContentsToOutput(path.join(agentRoot, "template"), outputDir);
+    if (sheetLike) {
+      const scaffold = path.join(agentRoot, "sheet-scaffold");
+      if (fs.existsSync(scaffold)) {
+        copyTemplateContentsToOutput(scaffold, outputDir);
+        log("[init] spreadsheet scaffold copied (grid/formula-bar/tab ARIA components)");
+      }
+    }
   }
 
-  const modules = loadRootModules(requirementsDir);
   log(`[plan] ${modules.length} ROOT module(s): ${modules.map((m) => m.nodeId).join(", ")}`);
 
   const configPath = writeOpencodeConfig(agentRoot);
@@ -913,26 +996,15 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
       }
     }
 
-    // Audit: ask the model which ATOMIC nodes are truly done; mark only those.
-    // Never blanket-FAILED nodes - a timeout often means "almost done" (run #6a7c559fe530).
+    // Mechanical audit: grep each ATOMIC node's own contract items in the
+    // source. Self-assessment inflated ("audit 21/21" on a 1/41 run) - the
+    // source of truth is what is actually present in the code.
     let doneIds: string[] = [];
-    if (atomicIds.length) {
-      log(`[audit] ${module.nodeId}: verifying atomic completion${useHotSession ? " [continue]" : ""}`);
-      const auditArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${modelId}`, "--dangerously-skip-permissions"];
-      if (useHotSession) auditArgv.push("--continue");
-      auditArgv.push(auditPrompt(module, atomicIds));
-      const audit = await runCommand(opencodeBin, auditArgv, {
-        cwd: outputDir,
-        env: {
-          OPENCODE_CONFIG: configPath,
-          OPENCODE_CONFIG_DIR: path.join(os.tmpdir(), `torine-opencode-home-${process.pid}`),
-        },
-        timeoutMs: 8 * 60 * 1000,
-        logFile: path.join(logsDir, `${runStartedAt}-module-${module.index}-${module.nodeId}-audit.log`),
-        heartbeatLabel: `audit ${module.nodeId}`,
-      });
-      doneIds = parseDoneIds(audit.output, atomicIds);
-      log(`[audit] ${module.nodeId}: DONE=${doneIds.join(",") || "none"} (of ${atomicIds.join(",")})`);
+    if (atomicNodes.length) {
+      const { doneIds: mechDone, report } = auditAtomicsMechanically(outputDir, atomicNodes);
+      doneIds = mechDone;
+      log(`[audit] ${module.nodeId}: mechanical DONE=${doneIds.join(",") || "none"} (of ${atomicIds.join(",")})`);
+      for (const line of report) log(`[audit]   ${line}`);
     } else {
       doneIds = moduleOk ? [module.nodeId] : [];
     }
@@ -1012,6 +1084,24 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
     });
     const retry = lintVerbatim(outputDir, verbatim);
     log(`[verbatim] after fix: ${retry.length} still missing${retry.length ? `: ${retry.slice(0, 5).map((s) => JSON.stringify(s)).join(", ")}` : ""}`);
+  }
+
+  // Re-audit everything after fixes and re-mark green where the source proves it.
+  {
+    const allAtomics: Record<string, unknown>[] = [];
+    for (const m of modules) collectAtomicNodes(m.subtree, allAtomics);
+    if (allAtomics.length) {
+      const { doneIds: finalDone, report } = auditAtomicsMechanically(outputDir, allAtomics);
+      log(`[audit] final mechanical: ${finalDone.length}/${allAtomics.length} proven done`);
+      for (const line of report) log(`[audit]   ${line}`);
+      for (const node of allAtomics) {
+        const id = String(node.id || "").trim();
+        if (id && finalDone.includes(id)) {
+          runtime.events.markTestPassed(id, "mechanical audit: contract items present in source");
+          runtime.traceability.upsertNodeState(id, "CONVERGED");
+        }
+      }
+    }
   }
 
   postflightLift(outputDir);

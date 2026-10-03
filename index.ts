@@ -322,7 +322,13 @@ function modulePrompt(module: RequirementModule, completedIds: string[], focus?:
     "",
     "NAVIGATION CONTRACT: every navigation target the requirement names (link/button/tab/menuitem named ... entries listed in the TASK CONTRACT SHEET above) MUST exist as a visible element with the right role on the page where the scenario reaches it. Navigation entries the scenario opens from a menu must be in that menu. Pages reachable only when signed out (account-access flows) must still show the site header with its sign-in entry.",
     "",
-    "RENDER CONTRACT: destination content must render synchronously on click - prefer plain <a> page loads over SPA transitions (test helpers assert immediately after a click resolves). If you use a router, make navigation commit synchronously.",
+    "RENDER CONTRACT (critical - most test failures come from violating this): destination content must be in the DOM by the time a click() resolves. Do NOT import { Link, NavLink } from 'react-router-dom' for navigation - SPA transitions render late and test helpers assert immediately after clicking. Use plain <a href> anchors (full page loads) or the provided components/AppLink.tsx. The router may stay for route matching only.",
+    "",
+    "FLOW RECIPES (verify each before finishing):",
+    "- Password recovery: after submitting the email on the recovery entry, the fixed verification code (e.g. \"123456\") must appear as VISIBLE TEXT on the page the user lands on, together with the Verification code and New password fields. Submitting with an empty field must not dead-end the flow.",
+    "- Label disambiguation: getByLabel('Email') must resolve to exactly one field at every step - never have both an 'Email' field and a 'Username or email' field visible on the same page state.",
+    "- Members/people lists must render every seeded member's username as exact visible text, with row action buttons named `Member menu <username>` (pattern `<menu label> <row identity>`) whose menuitems match the requirement verbs, visible only to users allowed to manage.",
+    "- Account menu must contain the entries the scenario clicks (typically Settings and Your organizations) before those clicks happen.",
     "",
     "ROLE WIDGET CONTRACT: dropdowns that tests pick options from must expose role=combobox with clickable role=option items (a custom listbox - native select popups are not clickable in tests). Widgets the tests call selectOption() on must be native <select> elements. Table rows with editable values use role=row with a per-row control and a Save button. Row action menus are buttons named `Member menu <value>` (pattern: `<menu label> <row identity>`) exposing menuitem entries, whose confirm dialogs use the verb button named exactly as the scenario states.",
     "",
@@ -345,13 +351,24 @@ function modulePrompt(module: RequirementModule, completedIds: string[], focus?:
   ].join("\n");
 }
 
-const VERBATIM_FIX_PROMPT = (missing: string[]) =>
+const VERBATIM_FIX_PROMPT = (missing: string[], navOffenders: string[]) =>
   [
-    "A mechanical verbatim lint found requirement text strings that are MISSING from the UI source.",
-    "Acceptance tests match visible text with anchored regexes - these strings must appear EXACTLY as written in the rendered UI (labels, buttons, links, error messages).",
-    "For each string below, find the right place (form field error, button/link text, heading, dialog) and use it verbatim - do NOT paraphrase, re-case, or reword:",
-    ...missing.map((s) => `- ${JSON.stringify(s)}`),
-    "Also re-check the TASK CONTRACT SHEET items from the module prompts (named UI targets and error messages) while you are at it and add any that are absent.",
+    "A mechanical lint found contract violations in the generated app. Fix them now:",
+    ...(missing.length
+      ? [
+          "",
+          "1) Missing requirement text strings (must appear EXACTLY in the rendered UI):",
+          ...missing.map((s) => `   - ${JSON.stringify(s)}`),
+        ]
+      : []),
+    ...(navOffenders.length
+      ? [
+          "",
+          "2) Files using react-router-dom Link/NavLink for navigation (test helpers assert immediately after click; SPA transitions race them). Replace every Link/NavLink with a plain <a href> anchor (or components/AppLink.tsx) - keep react-router only for route matching:",
+          ...navOffenders.map((f) => `   - ${f}`),
+        ]
+      : []),
+    "",
     "Keep everything else working. Finish with one line listing the files you touched.",
   ].join("\n");
 
@@ -674,6 +691,39 @@ function renderTaskContract(contract: TaskContract): string {
   return lines.join("\n");
 }
 
+function lintNavStyle(outputDir: string): string[] {
+  // SPA router links race the tests' immediate post-click assertions - catch
+  // react-router Link/NavLink usage mechanically.
+  const offenders: string[] = [];
+  const root = path.join(outputDir, "frontend", "src");
+  const walk = (dir: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (["node_modules", "dist"].includes(entry.name)) continue;
+        walk(full);
+      } else if (/\.tsx?$/.test(entry.name)) {
+        try {
+          const text = fs.readFileSync(full, "utf-8");
+          if (/import\s*\{[^}]*\b(Link|NavLink)\b[^}]*\}\s*from\s*['"]react-router-dom['"]/.test(text)) {
+            offenders.push(path.relative(outputDir, full));
+          }
+        } catch {
+          /* skip */
+        }
+      }
+    }
+  };
+  walk(root);
+  return offenders;
+}
+
 function lintVerbatim(outputDir: string, expected: Set<string>): string[] {
   const missing: string[] = [];
   const haystack: string[] = [];
@@ -926,7 +976,7 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
       OPENCODE_CONFIG: configPath,
       OPENCODE_CONFIG_DIR: path.join(os.tmpdir(), `torine-opencode-home-${process.pid}`),
     },
-    timeoutMs: nodeTimeoutMs,
+    timeoutMs: Math.min(nodeTimeoutMs, 10 * 60 * 1000),
     logFile: path.join(logsDir, `${runStartedAt}-final-check.log`),
     heartbeatLabel: "final-check",
   });
@@ -937,10 +987,12 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
   // that cost score on anchored-regex text matches (run 019f6c601311).
   const verbatim = extractVerbatimStrings(modules.map((m) => m.subtree));
   const missing = lintVerbatim(outputDir, verbatim);
+  const navOffenders = lintNavStyle(outputDir);
   log(`[verbatim] ${verbatim.size} contractual strings, ${missing.length} missing${missing.length ? `: ${missing.slice(0, 8).map((s) => JSON.stringify(s)).join(", ")}${missing.length > 8 ? " ..." : ""}` : ""}`);
-  if (missing.length) {
-    log(`[verbatim] sending fix turn for ${missing.length} missing strings`);
-    const fixArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${modelId}`, "--dangerously-skip-permissions", "--continue", VERBATIM_FIX_PROMPT(missing)];
+  if (navOffenders.length) log(`[lint] router-Link offenders: ${navOffenders.slice(0, 6).join(", ")}${navOffenders.length > 6 ? " ..." : ""}`);
+  if (missing.length || navOffenders.length) {
+    log(`[verbatim] sending fix turn (strings=${missing.length}, nav=${navOffenders.length})`);
+    const fixArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${modelId}`, "--dangerously-skip-permissions", "--continue", VERBATIM_FIX_PROMPT(missing, navOffenders)];
     await runCommand(opencodeBin, fixArgv, {
       cwd: outputDir,
       env: {

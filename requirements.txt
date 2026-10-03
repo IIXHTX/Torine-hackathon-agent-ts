@@ -1,0 +1,3 @@
+# Torine agent 的引擎是 Node/TypeScript（opencode + tsx）。
+# 这个 Python 入口（main.py）仅作启动壳，不需要任何第三方 Python 包。
+# 该文件按官方契约必须存在；保持为空依赖即可。

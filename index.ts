@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import YAML from "yaml";
@@ -163,29 +163,89 @@ function loadRootModules(requirementsDir: string): RequirementModule[] {
   });
 }
 
+function envModel(): string {
+  // Canonical name MODEL, with the team/gateway aliases as fallbacks.
+  return (process.env.MODEL || process.env.OCTOS_MODEL || process.env.OPENAI_MODEL || "").trim();
+}
+
 function modelSpec(): { providerId: string; modelId: string } {
-  const raw = (process.env.MODEL || "").trim();
+  const raw = envModel();
   if (!raw) return { providerId: "custom", modelId: "gpt-4o-mini" };
   const slash = raw.indexOf("/");
   if (slash > 0) return { providerId: raw.slice(0, slash), modelId: raw.slice(slash + 1) };
   return { providerId: "custom", modelId: raw };
 }
 
-function writeOpencodeConfig(agentRoot: string): string {
-  const baseUrl = (process.env.OPENAI_BASE_URL || "").trim();
-  const apiKey = (process.env.OPENAI_API_KEY || "").trim();
+// ---- Cost-aware model routing ----
+// By default only the MODEL-provided model is used (safest). If the platform /
+// team additionally supplies a cheap model (TORINE_FLASH_MODEL) and a strong
+// model (TORINE_STRONG_MODEL), the adapter picks per ROOT module by complexity
+// to cut token cost and avoid the over-budget penalty (exponent 0.2). Model
+// names may carry a "provider/" prefix, which is stripped here.
+type ModelPool = { providerId: string; base: string; flash: string; strong: string };
+
+function modelPool(): ModelPool {
   const { providerId, modelId } = modelSpec();
+  const strip = (raw: string): string => {
+    const v = (raw || "").trim();
+    if (!v) return "";
+    const slash = v.indexOf("/");
+    return slash > 0 ? v.slice(slash + 1) : v;
+  };
+  return {
+    providerId,
+    base: modelId,
+    flash: strip(process.env.TORINE_FLASH_MODEL || ""),
+    strong: strip(process.env.TORINE_STRONG_MODEL || ""),
+  };
+}
+
+// Estimate a requirement subtree's complexity: atomic node count + hard-feature
+// keywords + text size.
+function complexityOf(node: Record<string, unknown>): number {
+  const atoms: Record<string, unknown>[] = [];
+  collectAtomicNodes(node, atoms);
+  const blobs: string[] = [];
+  collectTextBlobs(node, blobs);
+  const text = blobs.join(" ");
+  let score = atoms.length;
+  if (/formula|calculat|permission|aggregat|pivot|validation|workflow|recursi|encrypt|sort|filter|\bsum\b|average|chart|graph|audit|ruleset|branch|merge|\brole\b|access/i.test(text)) score += 3;
+  if (text.length > 6000) score += 2;
+  if (text.length > 14000) score += 2;
+  return score;
+}
+
+// Pick a model by complexity. Prefer the strong model to protect the pass rate
+// rather than risking failures just to save tokens.
+function pickModel(pool: ModelPool, node: Record<string, unknown>): string {
+  const c = complexityOf(node);
+  if (c >= 9 && pool.strong) return pool.strong;
+  // Flash is only for genuinely tiny subtrees (c<=2); audit / FINAL_CHECK /
+  // rehearsal repair are forced to base at their call sites.
+  if (c <= 2 && pool.flash) return pool.flash;
+  return pool.base;
+}
+
+function writeOpencodeConfig(agentRoot: string): string {
+  // Gateway env aliases: canonical OPENAI_* with the team/gateway fallbacks.
+  const baseUrl = (process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE || "").trim();
+  const apiKey = (process.env.OPENAI_API_KEY || process.env.OPENAI_KEY || process.env.ARCBENCH_API_KEY || "").trim();
+  const pool = modelPool();
+  const modelEntries: Record<string, { name: string }> = {};
+  for (const mid of [pool.base, pool.flash, pool.strong]) {
+    if (mid) modelEntries[mid] = { name: mid };
+  }
   const config = {
     $schema: "https://opencode.ai/config.json",
     provider: {
-      [providerId]: {
+      [pool.providerId]: {
         npm: "@ai-sdk/openai-compatible",
         name: "ARC-Bench model gateway",
         options: {
           ...(baseUrl ? { baseURL: baseUrl } : {}),
           ...(apiKey ? { apiKey } : {}),
         },
-        models: { [modelId]: { name: modelId } },
+        models: modelEntries,
       },
     },
     skills: [path.join(agentRoot, "skills")],
@@ -208,12 +268,33 @@ function resolveOpencodeBin(agentRoot: string): string {
   return direct;
 }
 
-function runCommand(
+// Gateway-error classification for opencode runs. A "model wrote no files"
+// turn exits 0 (handled separately by NUDGE) and is NEVER a gateway error.
+// 401/402 (bad key / out of balance) are surfaced immediately, never retried.
+type GatewayVerdict = "none" | "retry" | "fatal";
+function classifyGatewayError(output: string, code: number | null): GatewayVerdict {
+  const tail = output.slice(-6000);
+  const looksAuth = /\b401\b|\b402\b|unauthori[sz]ed|invalid api key|invalid_token|forbidden.*api|insufficient|billing|payment required|quota.*exceeded/i.test(tail);
+  if (looksAuth && code !== 0) return "fatal";
+  const looksTransient =
+    /\b(429|500|501|502|503|504)\b|rate.?limit|too many requests|overloaded|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|EHOSTUNREACH|socket hang up|fetch failed|network error|bad gateway|service unavailable|gateway timeout/i.test(
+      tail,
+    );
+  // Only treat as a retryable gateway failure when the process actually errored
+  // out; a zero exit that merely produced no files is not a gateway problem.
+  if (looksTransient && code !== 0) return "retry";
+  return "none";
+}
+
+const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function runCommand(
   command: string,
   argv: string[],
-  options: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; logFile?: string; heartbeatLabel?: string },
+  options: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; logFile?: string; heartbeatLabel?: string; gatewayRetry?: boolean },
 ): Promise<{ code: number | null; output: string }> {
-  return new Promise((resolve) => {
+  const spawnOnce = (): Promise<{ code: number | null; output: string }> =>
+    new Promise((resolve) => {
     const child = spawn(command, argv, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env },
@@ -281,7 +362,40 @@ function runCommand(
       sink(`\n=== spawn error: ${String(error)} ===\n`);
       resolve({ code: 1, output: `${output}\nspawn error: ${String(error)}` });
     });
-  });
+    });
+
+  const result = await spawnOnce();
+  if (!options.gatewayRetry) return result;
+
+  // Exponential backoff on transient gateway errors (429 / 5xx). 401/402 are
+  // fatal (bad key / out of balance) - surface them immediately, never retry.
+  const verdict = classifyGatewayError(result.output, result.code);
+  if (verdict === "fatal") {
+    log("[gateway] auth/billing error (401/402); NOT retrying - surfacing to caller");
+    return result;
+  }
+  if (verdict === "none") return result;
+
+  const backoffs = [5000, 15000, 40000];
+  let combined = result.output;
+  let last = result;
+  for (let attempt = 0; attempt < backoffs.length; attempt += 1) {
+    log(`[gateway] transient error (attempt ${attempt + 1}/${backoffs.length}); backing off ${backoffs[attempt] / 1000}s then retrying opencode`);
+    await sleepMs(backoffs[attempt]);
+    last = await spawnOnce();
+    combined += `\n--- gateway retry #${attempt + 1} exit=${last.code} ---\n${last.output}`;
+    const v = classifyGatewayError(last.output, last.code);
+    if (v === "fatal") {
+      log("[gateway] auth/billing error on retry (401/402); NOT retrying further");
+      return { code: last.code, output: combined };
+    }
+    if (v === "none") {
+      log(`[gateway] retry #${attempt + 1} recovered (exit ${last.code})`);
+      return { code: last.code, output: combined };
+    }
+  }
+  log(`[gateway] exhausted ${backoffs.length} retries; surfacing last result (exit ${last.code})`);
+  return { code: last.code, output: combined };
 }
 
 function modulePrompt(module: RequirementModule, completedIds: string[], focus?: { label: string; json: string }): string {
@@ -590,62 +704,6 @@ function parseDoneIds(output: string, knownIds: string[]): string[] {
   return listed.filter((id) => knownIds.includes(id));
 }
 
-// Mechanical audit: self-assessment inflates ("audit 21/21" on a 1/41 run).
-// Verify each ATOMIC node by grepping the source for its own contract items
-// (named UI targets + error strings derived from its requirement text).
-function readSourceCorpus(outputDir: string): string {
-  const chunks: string[] = [];
-  for (const root of ["frontend/src", "backend/src"]) {
-    const walk = (dir: string): void => {
-      let entries: fs.Dirent[];
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const entry of entries) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (["node_modules", "dist", "__pycache__"].includes(entry.name)) continue;
-          walk(full);
-        } else if (/\.(tsx?|jsx?|css|html)$/.test(entry.name)) {
-          try {
-            chunks.push(fs.readFileSync(full, "utf-8"));
-          } catch {
-            /* skip */
-          }
-        }
-      }
-    };
-    walk(path.join(outputDir, root));
-  }
-  return chunks.join("\n");
-}
-
-function auditAtomicsMechanically(
-  outputDir: string,
-  atomicNodes: Record<string, unknown>[],
-): { doneIds: string[]; report: string[] } {
-  const corpus = readSourceCorpus(outputDir);
-  const doneIds: string[] = [];
-  const report: string[] = [];
-  for (const node of atomicNodes) {
-    const id = String(node.id || "").trim();
-    const contract = extractTaskContract(node);
-    const namedValues = contract.namedTargets.map((t) => t.slice(t.indexOf(":") + 2).trim());
-    const missingNamed = namedValues.filter((v) => v && !corpus.includes(v));
-    const missingErrors = contract.errorStrings.filter((e) => !corpus.includes(e));
-    const ok = missingNamed.length === 0 && missingErrors.length === 0;
-    if (ok) doneIds.push(id);
-    report.push(
-      `${id}: ${ok ? "DONE" : "MISSING"} (named ${namedValues.length - missingNamed.length}/${namedValues.length}, errors ${contract.errorStrings.length - missingErrors.length}/${contract.errorStrings.length})` +
-        (missingNamed.length ? ` no-named: ${missingNamed.slice(0, 3).join("|")}` : "") +
-        (missingErrors.length ? ` no-err: ${missingErrors.slice(0, 2).join("|")}` : ""),
-    );
-  }
-  return { doneIds, report };
-}
-
 // Verbatim lint: the acceptance tests match visible text with anchored regexes,
 // so every quoted string in a requirement is a contractual UI string. Collect
 // them from the requirement JSON and check the generated source for each.
@@ -691,7 +749,6 @@ type TaskContract = {
   namedTargets: string[];
   errorStrings: string[];
   seeds: string[];
-  isSpreadsheet: boolean;
 };
 
 function extractTaskContract(node: Record<string, unknown>): TaskContract {
@@ -729,21 +786,8 @@ function extractTaskContract(node: Record<string, unknown>): TaskContract {
   }
 
   const seeds = [...new Set([...text.matchAll(/`([^`\s][^`]{0,60})`/g)].map((m) => m[1]))];
-  const isSpreadsheet = /worksheet|spreadsheet|cell(?:s)?\b|formula|gridcell|pivot table/i.test(text);
-  return { namedTargets, errorStrings, seeds, isSpreadsheet };
+  return { namedTargets, errorStrings, seeds };
 }
-
-const SPREADSHEET_RECIPE = [
-  "SPREADSHEET RECIPE (aria/behavior contracts the acceptance tests assert):",
-  "- Grid: container role=grid; each row role=row; each cell role=gridcell with aria-label EXACTLY the coordinate (\"A1\", \"B2\") and text content = the DISPLAYED value (computed result for formula cells, never the formula text). Selected cells get aria-selected=\"true\"; range-selectable grids set aria-multiselectable=\"true\" on the grid and keep aria-selected accurate for every cell in the rectangle.",
-  "- Formula bar: a textbox labeled \"Formula bar\" shows the RAW formula of the selected cell (grid shows the computed result); pressing Enter in it commits. Inline cell editors are textboxes named \"Edit <coordinate>\".",
-  "- Worksheet tabs: role=tab, with aria-selected=\"true\" on exactly the active sheet's tab.",
-  "- CSV export renders COMPUTED values (a cell holding =A1*2 exports as 4, not the formula).",
-  "- Buttons are matched by whole-word case-insensitive regexes (/^(save)$/i) - name them exactly (e.g. \"Save\").",
-  "- Formula engine: formulas start with =; support + - * /, parentheses, A1 references, SUM/AVERAGE/COUNT/MIN/MAX over ranges; relative refs shift on copy, absolute ($A$1) do not; error values #DIV/0! #REF! #NAME? #ERROR! render in the grid while the formula bar keeps the original formula; edits recalculate all direct/indirect dependents.",
-  "- Selection/copy/paste: rectangular selection persists per worksheet across reloads and sheet switches; paste fills the exact rectangle; validation failures reject the WHOLE operation and keep original values.",
-  "- Undo/Redo buttons named exactly \"Undo\"/\"Redo\" cover the session's recent edits in reverse order.",
-].join("\n");
 
 function renderTaskContract(contract: TaskContract): string {
   const lines: string[] = ["TASK CONTRACT SHEET (derived from this requirement subtree - treat as checklist):"];
@@ -761,10 +805,6 @@ function renderTaskContract(contract: TaskContract): string {
     lines.push("Seed/example values referenced by scenarios (provision in DB seed and use verbatim):");
     for (const s of contract.seeds.slice(0, 30)) lines.push(`  - ${JSON.stringify(s)}`);
     if (contract.seeds.length > 30) lines.push(`  ... and ${contract.seeds.length - 30} more`);
-  }
-  if (contract.isSpreadsheet) {
-    lines.push("");
-    lines.push(SPREADSHEET_RECIPE);
   }
   return lines.join("\n");
 }
@@ -835,6 +875,134 @@ function lintVerbatim(outputDir: string, expected: Set<string>): string[] {
   return missing;
 }
 
+// ---- Sheet-task domain judgement + cost + traceability (fusion 4.2.4) ----
+
+// Concatenate every md/yaml/txt requirement file under the requirements dir so
+// the domain judgement sees the whole brief, not just requirements.yaml.
+function readAllRequirementText(requirementsDir: string): string {
+  const parts: string[] = [];
+  const walk = (dir: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (["node_modules", ".git", ".arc", "reference"].includes(entry.name)) continue;
+        walk(full);
+      } else if (/\.(md|ya?ml|txt)$/i.test(entry.name)) {
+        try {
+          parts.push(fs.readFileSync(full, "utf-8"));
+        } catch {
+          /* unreadable - skip */
+        }
+      }
+    }
+  };
+  walk(requirementsDir);
+  return parts.join("\n");
+}
+
+function isSheetTask(requirementsDir: string): boolean {
+  const raw = readAllRequirementText(requirementsDir).toLowerCase();
+  const count = (kws: string[]): number => kws.reduce((n, k) => n + (raw.includes(k) ? 1 : 0), 0);
+  const sheet = count([
+    "workbook",
+    "worksheet",
+    "spreadsheet",
+    "spread sheet",
+    "cell",
+    "formula",
+    "pivot",
+    "sheet tab",
+    "row",
+    "column",
+  ]);
+  const other = count(["repository", "pull request", "pull-request", "issue", "organization", "team", "milestone"]);
+  return sheet >= 2 && sheet > other;
+}
+
+// Best-effort cumulative-cost collection from opencode logs. Scans
+// .arc/logs/*.log for explicit `cost` fields or usage token counts and folds
+// them into a rough CNY figure. Parsing nothing returns 0 (the cost signal
+// then simply does not trigger a fallback) - never throws, never blocks.
+function readCumulativeCost(logsDir: string): number {
+  try {
+    if (!fs.existsSync(logsDir)) return 0;
+    let costCny = 0;
+    let sawSignal = false;
+    for (const name of fs.readdirSync(logsDir)) {
+      if (!name.endsWith(".log")) continue;
+      let text = "";
+      try {
+        text = fs.readFileSync(path.join(logsDir, name), "utf-8");
+      } catch {
+        continue;
+      }
+      // Explicit cost field (gateway usually emits USD).
+      for (const m of text.matchAll(/"?cost"?\s*[:=]\s*\$?([0-9]+\.?[0-9]*)/gi)) {
+        costCny += Number(m[1]) * 7.2;
+        sawSignal = true;
+      }
+      // Usage tokens (input/output) folded at a cheap-gateway price table.
+      let inTok = 0;
+      let outTok = 0;
+      for (const m of text.matchAll(/"?(?:prompt_tokens|input_tokens)"?\s*[:=]\s*([0-9]+)/gi)) inTok += Number(m[1]);
+      for (const m of text.matchAll(/"?(?:completion_tokens|output_tokens)"?\s*[:=]\s*([0-9]+)/gi)) outTok += Number(m[1]);
+      if (inTok > 0 || outTok > 0) {
+        sawSignal = true;
+        // rough CNY per 1k tokens: input 0.001, output 0.004
+        costCny += (inTok / 1000) * 0.001 + (outTok / 1000) * 0.004;
+      }
+    }
+    return sawSignal ? costCny : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Deterministic scenario ids: real requirement trees give scenarios only a
+// `name`, never an `id`. This is a legitimate SDK/format gap fix (not a
+// hardcoded answer) - assign <parentNodeId>-S<ordinal 1-based> to any missing.
+function assignScenarioIds(node: Record<string, unknown>): void {
+  const parentId = String(node.id || node.req_id || "").trim();
+  const scenarios = Array.isArray(node.scenarios) ? node.scenarios : [];
+  scenarios.forEach((scenario: unknown, index: number) => {
+    if (scenario && typeof scenario === "object") {
+      const sc = scenario as Record<string, unknown>;
+      if (!String(sc.id || "").trim() && parentId) sc.id = `${parentId}-S${index + 1}`;
+    }
+  });
+  for (const child of Array.isArray(node.children) ? node.children : []) {
+    if (child && typeof child === "object") assignScenarioIds(child as Record<string, unknown>);
+  }
+}
+
+// Persist the full requirement tree (modules / pages / atomic nodes / scenarios)
+// to .arc/requirement-tree.json for traceability. The official JS SDK has no
+// store_requirement_tree call, so we carry the tree in our own .arc file; the
+// SDK still emits its own runner-events normally (we do not fake SDK calls).
+function writeRequirementTree(requirementsDir: string, outputDir: string): void {
+  try {
+    const reqPath = path.join(requirementsDir, "requirements.yaml");
+    if (!fs.existsSync(reqPath)) {
+      log("[trace] requirements.yaml not found; skipping requirement-tree.json");
+      return;
+    }
+    const payload = YAML.parse(fs.readFileSync(reqPath, "utf-8")) as Record<string, unknown>;
+    assignScenarioIds(payload);
+    const arcDir = path.join(outputDir, ".arc");
+    fs.mkdirSync(arcDir, { recursive: true });
+    fs.writeFileSync(path.join(arcDir, "requirement-tree.json"), JSON.stringify(payload, null, 2));
+    log(`[trace] wrote .arc/requirement-tree.json (root=${String(payload.id || "ROOT")})`);
+  } catch (error) {
+    log(`[trace] requirement-tree.json write failed (non-blocking): ${String(error)}`);
+  }
+}
+
 function startPortWatchdog(webPort: number, outputDir: string): NodeJS.Timeout {
   const root = outputDir.replace(/\/+$/, "");
   const tick = async (): Promise<void> => {
@@ -875,31 +1043,36 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
   runtime.traceability.initDb();
   runtime.git.ensureRepo();
 
-  const modules = loadRootModules(requirementsDir);
-  const sheetLike = modules.some((m) => extractTaskContract(m.subtree).isSpreadsheet);
-
   if (hasDeliverable(outputDir)) {
     log("[init] existing frontend/+backend/ detected; keeping prior work (evolution mode)");
   } else {
-    log(`[init] copying starter template into output directory${sheetLike ? " (+ spreadsheet scaffold)" : ""}`);
+    log("[init] copying starter template into output directory");
     copyTemplateContentsToOutput(path.join(agentRoot, "template"), outputDir);
-    if (sheetLike) {
-      const scaffold = path.join(agentRoot, "sheet-scaffold");
-      if (fs.existsSync(scaffold)) {
-        copyTemplateContentsToOutput(scaffold, outputDir);
-        log("[init] spreadsheet scaffold copied (grid/formula-bar/tab ARIA components)");
-      }
-    }
   }
 
+  const modules = loadRootModules(requirementsDir);
   log(`[plan] ${modules.length} ROOT module(s): ${modules.map((m) => m.nodeId).join(", ")}`);
+
+  // Traceability: persist the full requirement tree (modules / pages / atomic
+  // nodes / scenarios, with deterministic scenario ids) to .arc/requirement-tree.json.
+  writeRequirementTree(requirementsDir, outputDir);
+  let totalAtomicNodeCount = 0;
+  for (const m of modules) {
+    const atoms: Record<string, unknown>[] = [];
+    collectAtomicNodes(m.subtree, atoms);
+    totalAtomicNodeCount += atoms.length;
+  }
+  log(`[plan] ${totalAtomicNodeCount} atomic node(s) across all modules`);
 
   const configPath = writeOpencodeConfig(agentRoot);
   const opencodeBin = resolveOpencodeBin(agentRoot);
   const { providerId, modelId } = modelSpec();
+  const pool = modelPool();
   const nodeTimeoutMs = Number(process.env.TORINE_NODE_TIMEOUT_MS || 45 * 60 * 1000);
   const completedIds: string[] = [];
   const failedIds: string[] = [];
+  // Whole-task health aggregated inside the module loop (fusion 4.2.4).
+  const taskHealth = { failed: 0, timeouts: 0, noChange: 0 };
   const logsDir = path.join(outputDir, ".arc", "logs");
   const runStartedAt = new Date().toISOString().replace(/[:.]/g, "-");
   const watchdog = startPortWatchdog(webPort, outputDir);
@@ -909,7 +1082,10 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
     // module starts fresh - a single growing session across all turns re-sends
     // the whole conversation every turn (O(n^2) token cost, $18 runs).
     let useHotSession = false;
-    log(`[module ${module.index}/${module.total}] ${module.nodeId} - ${module.name}`);
+    // Cost-aware routing: choose this module's model by complexity. The local
+    // modelId shadows the outer base model for every opencode call in this module.
+    const modelId = pickModel(pool, module.subtree);
+    log(`[module ${module.index}/${module.total}] ${module.nodeId} - ${module.name} (model ${providerId}/${modelId}, complexity ${complexityOf(module.subtree)})`);
     runtime.events.markImplementationStarted(module.nodeId, `opencode implementing ${module.name}`);
 
     const atomicNodes: Record<string, unknown>[] = [];
@@ -965,6 +1141,7 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
         timeoutMs: nodeTimeoutMs,
         logFile: path.join(logsDir, `${runStartedAt}-${turn.logName}.log`),
         heartbeatLabel: `turn ${turn.label}`,
+        gatewayRetry: true,
       });
       useHotSession = true;
       // NUDGE (octos lesson): a turn that only reads/analyzes wrote no files.
@@ -980,8 +1157,16 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
           },
           timeoutMs: nodeTimeoutMs,
           logFile: path.join(logsDir, `${runStartedAt}-${turn.logName}-nudge.log`),
+          gatewayRetry: true,
         });
+        // Still no file change after the nudge => a genuine no-op (空转).
+        if (workspaceSignature(outputDir) === before) {
+          log(`[turn] ${turn.label}: still no file changes after nudge (noChange++)`);
+          taskHealth.noChange += 1;
+        }
       }
+      // Health: a SIGTERM'd/killed run (code===null) or a logged TIMEOUT is a timeout.
+      if (result.code === null || /=== TIMEOUT:/.test(result.output)) taskHealth.timeouts += 1;
       const seconds = ((Date.now() - started) / 1000).toFixed(1);
       if (result.code === 0) {
         log(`[turn] ${turn.label} ok in ${seconds}s`);
@@ -996,15 +1181,28 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
       }
     }
 
-    // Mechanical audit: grep each ATOMIC node's own contract items in the
-    // source. Self-assessment inflated ("audit 21/21" on a 1/41 run) - the
-    // source of truth is what is actually present in the code.
+    // Audit: ask the model which ATOMIC nodes are truly done; mark only those.
+    // Never blanket-FAILED nodes - a timeout often means "almost done" (run #6a7c559fe530).
     let doneIds: string[] = [];
-    if (atomicNodes.length) {
-      const { doneIds: mechDone, report } = auditAtomicsMechanically(outputDir, atomicNodes);
-      doneIds = mechDone;
-      log(`[audit] ${module.nodeId}: mechanical DONE=${doneIds.join(",") || "none"} (of ${atomicIds.join(",")})`);
-      for (const line of report) log(`[audit]   ${line}`);
+    if (atomicIds.length) {
+      log(`[audit] ${module.nodeId}: verifying atomic completion${useHotSession ? " [continue]" : ""}`);
+      // Audit is a judgement call: always on the base model, never flash.
+      const auditArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${pool.base}`, "--dangerously-skip-permissions"];
+      if (useHotSession) auditArgv.push("--continue");
+      auditArgv.push(auditPrompt(module, atomicIds));
+      const audit = await runCommand(opencodeBin, auditArgv, {
+        cwd: outputDir,
+        env: {
+          OPENCODE_CONFIG: configPath,
+          OPENCODE_CONFIG_DIR: path.join(os.tmpdir(), `torine-opencode-home-${process.pid}`),
+        },
+        timeoutMs: 8 * 60 * 1000,
+        logFile: path.join(logsDir, `${runStartedAt}-module-${module.index}-${module.nodeId}-audit.log`),
+        heartbeatLabel: `audit ${module.nodeId}`,
+        gatewayRetry: true,
+      });
+      doneIds = parseDoneIds(audit.output, atomicIds);
+      log(`[audit] ${module.nodeId}: DONE=${doneIds.join(",") || "none"} (of ${atomicIds.join(",")})`);
     } else {
       doneIds = moduleOk ? [module.nodeId] : [];
     }
@@ -1037,6 +1235,7 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
       // done nodes turned green above.
       log(`[module ${module.index}/${module.total}] ${module.nodeId} partial (done: ${doneIds.join(",") || "none"})`);
       failedIds.push(module.nodeId);
+      taskHealth.failed += 1;
     }
     runtime.events.notifyTraceabilityChanged(`module ${module.nodeId} finished`);
     runtime.git.commit(`${module.nodeId} (${moduleOk ? "implement" : "partial"}): ${module.name}`);
@@ -1048,7 +1247,8 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
   // Fresh session: it must audit the whole app with its own eyes, and a fresh
   // session also avoids re-carrying every module's transcript.
   log("[final-check] strict-mode audit");
-  const finalArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${modelId}`, "--dangerously-skip-permissions"];
+  // FINAL_CHECK is a judgement pass: always the base model, never flash.
+  const finalArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${pool.base}`, "--dangerously-skip-permissions"];
   finalArgv.push(FINAL_CHECK_PROMPT(webPort));
   await runCommand(opencodeBin, finalArgv, {
     cwd: outputDir,
@@ -1059,6 +1259,7 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
     timeoutMs: Math.min(nodeTimeoutMs, 10 * 60 * 1000),
     logFile: path.join(logsDir, `${runStartedAt}-final-check.log`),
     heartbeatLabel: "final-check",
+    gatewayRetry: true,
   });
 
   // VERBATIM LINT: mechanical check of requirement quoted strings vs source.
@@ -1071,7 +1272,7 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
   if (navOffenders.length) log(`[lint] router-Link offenders: ${navOffenders.slice(0, 6).join(", ")}${navOffenders.length > 6 ? " ..." : ""}`);
   if (missing.length || navOffenders.length) {
     log(`[verbatim] sending fix turn (strings=${missing.length}, nav=${navOffenders.length})`);
-    const fixArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${modelId}`, "--dangerously-skip-permissions", VERBATIM_FIX_PROMPT(missing, navOffenders)];
+    const fixArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${pool.base}`, "--dangerously-skip-permissions", VERBATIM_FIX_PROMPT(missing, navOffenders)];
     await runCommand(opencodeBin, fixArgv, {
       cwd: outputDir,
       env: {
@@ -1081,26 +1282,53 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
       timeoutMs: nodeTimeoutMs,
       logFile: path.join(logsDir, `${runStartedAt}-verbatim-fix.log`),
       heartbeatLabel: "verbatim-fix",
+      gatewayRetry: true,
     });
     const retry = lintVerbatim(outputDir, verbatim);
     log(`[verbatim] after fix: ${retry.length} still missing${retry.length ? `: ${retry.slice(0, 5).map((s) => JSON.stringify(s)).join(", ")}` : ""}`);
   }
 
-  // Re-audit everything after fixes and re-mark green where the source proves it.
+  // —— Sheet fallback (fusion 4.2.4): health-gated deterministic generator.
+  // Only for sheet-domain tasks; a non-sheet task that fails is NOT rescued by
+  // a spreadsheet generator (that would emit an off-topic app).
   {
-    const allAtomics: Record<string, unknown>[] = [];
-    for (const m of modules) collectAtomicNodes(m.subtree, allAtomics);
-    if (allAtomics.length) {
-      const { doneIds: finalDone, report } = auditAtomicsMechanically(outputDir, allAtomics);
-      log(`[audit] final mechanical: ${finalDone.length}/${allAtomics.length} proven done`);
-      for (const line of report) log(`[audit]   ${line}`);
-      for (const node of allAtomics) {
-        const id = String(node.id || "").trim();
-        if (id && finalDone.includes(id)) {
-          runtime.events.markTestPassed(id, "mechanical audit: contract items present in source");
-          runtime.traceability.upsertNodeState(id, "CONVERGED");
-        }
+    const sheetTask = isSheetTask(requirementsDir);
+    const failRatio = taskHealth.failed / Math.max(1, modules.length);
+    const costBudget = Number(process.env.TORINE_COST_BUDGET || Math.max(6, 0.4 * totalAtomicNodeCount * 1.2));
+    const costOver = readCumulativeCost(logsDir) >= costBudget;
+    const needFallback =
+      sheetTask && (failRatio >= 0.5 || taskHealth.timeouts >= 2 || taskHealth.noChange >= 2 || costOver);
+    if (needFallback) {
+      log(
+        `[fallback] sheet task unhealthy (failRatio=${failRatio.toFixed(2)}, failed=${taskHealth.failed}, ` +
+          `timeout=${taskHealth.timeouts}, noChange=${taskHealth.noChange}, costOver=${costOver}, budget=${costBudget.toFixed(2)}); ` +
+          "invoking external/contract_gen.py --no-llm",
+      );
+      try {
+        runtime.git.commit("checkpoint before sheet fallback");
+      } catch (error) {
+        log(`[fallback] git checkpoint failed (non-blocking): ${String(error)}`);
       }
+      const script = path.join(agentRoot, "external", "contract_gen.py");
+      const r = spawnSync("python3", [script, requirementsDir, "--output-dir", outputDir, "--no-llm"], {
+        encoding: "utf8",
+      });
+      log(
+        `[fallback] contract_gen exit=${r.status ?? "null"}` +
+          (r.stderr ? ` stderr=${String(r.stderr).slice(-400)}` : ""),
+      );
+      try {
+        runtime.git.commit("chore: sheet fallback generated scaffold");
+      } catch {
+        /* no-op commit if nothing changed */
+      }
+      // Naturally falls through to postflightLift -> ensureDockerfile -> REHEARSAL,
+      // which rebuilds/probes the fallback output (no separate rehearsal written).
+    } else if (sheetTask) {
+      log(
+        `[fallback] sheet task healthy (failRatio=${failRatio.toFixed(2)}, failed=${taskHealth.failed}, ` +
+          `timeout=${taskHealth.timeouts}, noChange=${taskHealth.noChange}); no fallback needed`,
+      );
     }
   }
 
@@ -1139,7 +1367,8 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
       log(`[rehearsal] FAILED: ${failure}`);
       if (attempt >= 2) break;
       log("[rehearsal] sending repair turn");
-      const repairArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${modelId}`, "--dangerously-skip-permissions", "--continue", REPAIR_PROMPT(failure)];
+      // Rehearsal repair is a judgement fix: always the base model, never flash.
+      const repairArgv = ["run", "--dir", outputDir, "-m", `${providerId}/${pool.base}`, "--dangerously-skip-permissions", "--continue", REPAIR_PROMPT(failure)];
       await runCommand(opencodeBin, repairArgv, {
         cwd: outputDir,
         env: {
@@ -1148,6 +1377,7 @@ async function runAgent(runtime: AgentRuntime, requirementsDir: string, outputDi
         },
         timeoutMs: nodeTimeoutMs,
         logFile: path.join(logsDir, `${runStartedAt}-rehearsal-repair.log`),
+        gatewayRetry: true,
       });
     }
     runtime.git.commit("chore: rehearsal and final verification pass");
